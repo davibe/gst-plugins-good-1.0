@@ -126,6 +126,8 @@
 #  include <unistd.h>
 #endif
 
+#include <gst/video/video.h>
+
 #include "gstqtmux.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_qt_mux_debug);
@@ -224,6 +226,14 @@ static gboolean gst_qt_mux_sink_event (GstCollectPads * pads,
 
 static GstFlowReturn gst_qt_mux_handle_buffer (GstCollectPads * pads,
     GstCollectData * cdata, GstBuffer * buf, gpointer user_data);
+
+static gboolean gst_qt_mux_src_event (GstPad * pad, GstObject * parent,
+    GstEvent * event);
+
+static GstEvent *check_pending_key_unit_event (GstEvent * pending_event,
+    GstSegment * segment, GstClockTime timestamp,
+    GstClockTime pending_key_unit_ts);
+
 static GstFlowReturn gst_qt_mux_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
     GstBuffer * buf);
 
@@ -383,6 +393,7 @@ gst_qt_mux_pad_reset (GstQTPad * qtpad)
   qtpad->total_duration = 0;
   qtpad->total_bytes = 0;
   qtpad->sparse = FALSE;
+  qtpad->flush_time = GST_CLOCK_TIME_NONE;
 
   qtpad->buf_head = 0;
   qtpad->buf_tail = 0;
@@ -483,6 +494,7 @@ gst_qt_mux_init (GstQTMux * qtmux, GstQTMuxClass * qtmux_klass)
 
   templ = gst_element_class_get_pad_template (klass, "src");
   qtmux->srcpad = gst_pad_new_from_template (templ, "src");
+  gst_pad_set_event_function (qtmux->srcpad, gst_qt_mux_src_event);
   gst_pad_use_fixed_caps (qtmux->srcpad);
   gst_element_add_pad (GST_ELEMENT (qtmux), qtmux->srcpad);
 
@@ -495,6 +507,9 @@ gst_qt_mux_init (GstQTMux * qtmux, GstQTMuxClass * qtmux_klass)
   gst_collect_pads_set_clip_function (qtmux->collect,
       GST_DEBUG_FUNCPTR (gst_collect_pads_clip_running_time), qtmux);
 
+  qtmux->force_key_unit_event = NULL;
+  qtmux->pending_downstream_key_unit_event = NULL;
+  qtmux->pending_key_unit_ts = GST_CLOCK_TIME_NONE;
   /* properties set to default upon construction */
 
   /* always need this */
@@ -1802,7 +1817,7 @@ gst_qt_mux_start_file (GstQTMux * qtmux)
     /* well, it's moov pos if fragmented ... */
     qtmux->mdat_pos = qtmux->header_size;
 
-    if (qtmux->fragment_duration) {
+    if (qtmux->fragment_duration || (qtmux->fragment_sequence == 1)) {
       GST_DEBUG_OBJECT (qtmux, "fragment duration %d ms, writing headers",
           qtmux->fragment_duration);
       /* also used as snapshot marker to indicate fragmented file */
@@ -2093,16 +2108,30 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
     guint32 delta, guint32 size, gboolean sync, gint64 pts_offset)
 {
   GstFlowReturn ret = GST_FLOW_OK;
+  GstClockTime buf_running_time;
 
   /* setup if needed */
   if (G_UNLIKELY (!pad->traf || force))
     goto init;
 
+  buf_running_time = gst_segment_to_running_time (&pad->collect.segment,
+      GST_FORMAT_TIME, buf->pts);
+
+  if (G_UNLIKELY (pad->flush_time != GST_CLOCK_TIME_NONE &&
+          pad->flush_time <= buf->pts)) {
+    GST_LOG_OBJECT (qtmux, "Forcing FKU fragment on pad %s at running time %ld",
+        gst_pad_get_name (pad->collect.pad), buf_running_time);
+    force = TRUE;
+    pad->flush_time = GST_CLOCK_TIME_NONE;
+  }
+
 flush:
   /* flush pad fragment if threshold reached,
    * or at new keyframe if we should be minding those in the first place */
   if (G_UNLIKELY (force || (sync && pad->sync) ||
-          pad->fragment_duration < (gint64) delta)) {
+          ((qtmux->fragment_duration != 0) &&
+              (pad->fragment_duration < (gint64) delta)))) {
+
     AtomMOOF *moof;
     guint64 size = 0, offset = 0;
     guint8 *data = NULL;
@@ -2144,6 +2173,43 @@ flush:
         gst_buffer_unref (atom_array_index (&pad->fragment_buffers, i));
     }
 
+    if (qtmux->pending_downstream_key_unit_event != NULL) {
+      GSList *walk;
+      gboolean all_pad_flushed = TRUE;
+      GstQTPad *collected_pad;
+
+      walk = qtmux->collect->data;
+      while (walk) {
+        collected_pad = (GstQTPad *) walk->data;
+        if (collected_pad->flush_time != GST_CLOCK_TIME_NONE) {
+          all_pad_flushed = FALSE;
+        }
+        walk = g_slist_next (walk);
+      }
+
+      pad->flush_time = GST_CLOCK_TIME_NONE;
+
+      if (all_pad_flushed) {
+        GstClockTime running_time;
+        guint count;
+
+        gst_video_event_parse_downstream_force_key_unit
+            (qtmux->pending_downstream_key_unit_event, NULL, NULL,
+            &running_time, NULL, &count);
+
+        GST_INFO_OBJECT (qtmux, "pushing downstream force-key-unit event %d "
+            "%" GST_TIME_FORMAT " count %d",
+            gst_event_get_seqnum (qtmux->pending_downstream_key_unit_event),
+            GST_TIME_ARGS (running_time), count);
+
+        gst_pad_push_event (qtmux->srcpad,
+            qtmux->pending_downstream_key_unit_event);
+        gst_event_replace (&qtmux->force_key_unit_event, NULL);
+        gst_event_replace (&qtmux->pending_downstream_key_unit_event, NULL);
+        qtmux->pending_key_unit_ts = GST_CLOCK_TIME_NONE;
+      }
+    }
+
     atom_array_clear (&pad->fragment_buffers);
     atom_moof_free (moof);
     qtmux->fragment_sequence++;
@@ -2155,8 +2221,10 @@ init:
     GST_LOG_OBJECT (qtmux, "setting up new fragment");
     pad->traf = atom_traf_new (qtmux->context, atom_trak_get_id (pad->trak));
     atom_array_init (&pad->fragment_buffers, 512);
-    pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
-        atom_trak_get_timescale (pad->trak), 1000);
+    if (qtmux->fragment_duration != 0) {
+      pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
+          atom_trak_get_timescale (pad->trak), 1000);
+    }
 
     if (G_UNLIKELY (qtmux->mfra && !pad->tfra)) {
       pad->tfra = atom_tfra_new (qtmux->context, atom_trak_get_id (pad->trak));
@@ -2168,7 +2236,9 @@ init:
   atom_traf_add_samples (pad->traf, delta, size, sync, pts_offset,
       pad->sync && sync);
   atom_array_append (&pad->fragment_buffers, buf, 256);
-  pad->fragment_duration -= delta;
+  if (qtmux->fragment_duration != 0) {
+    pad->fragment_duration -= delta;
+  }
 
   if (pad->tfra) {
     guint32 sn = atom_traf_get_sample_num (pad->traf);
@@ -2571,6 +2641,36 @@ gst_qt_mux_handle_buffer (GstCollectPads * pads, GstCollectData * cdata,
     best_time = GST_BUFFER_PTS (buf);
     GST_LOG_OBJECT (qtmux, "selected pad %s with time %" GST_TIME_FORMAT,
         GST_PAD_NAME (best_pad->collect.pad), GST_TIME_ARGS (best_time));
+
+    if (qtmux->pending_key_unit_ts != GST_CLOCK_TIME_NONE &&
+        qtmux->pending_downstream_key_unit_event == NULL) {
+      GstEvent *event;
+
+      event = check_pending_key_unit_event (qtmux->force_key_unit_event,
+          &best_pad->collect.segment, GST_BUFFER_TIMESTAMP (buf),
+          qtmux->pending_key_unit_ts);
+      if (event) {
+        GstClockTime running_time;
+        guint count;
+        GstQTPad *collected_pad;
+        GSList *walk;
+
+        gst_video_event_parse_downstream_force_key_unit (event,
+            NULL, NULL, &running_time, NULL, &count);
+
+        gst_event_replace (&qtmux->pending_downstream_key_unit_event, event);
+
+        /* force collected pads to flush at key unit running_time */
+        walk = qtmux->collect->data;
+        while (walk) {
+          collected_pad = (GstQTPad *) walk->data;
+          collected_pad->flush_time = running_time;
+          walk = g_slist_next (walk);
+        }
+
+      }
+    }
+
     ret = gst_qt_mux_add_buffer (qtmux, best_pad, buf);
   } else {
     ret = gst_qt_mux_stop_file (qtmux);
@@ -3408,14 +3508,152 @@ gst_qt_mux_sink_event (GstCollectPads * pads, GstCollectData * data,
       ret = TRUE;
       break;
     }
+    case GST_EVENT_CUSTOM_DOWNSTREAM:
+    {
+      GstClockTime timestamp, stream_time, running_time;
+      gboolean all_headers;
+      guint count;
+
+      ret = TRUE;
+
+      if (!gst_video_event_is_force_key_unit (event))
+        goto out;
+
+      gst_video_event_parse_downstream_force_key_unit (event,
+          &timestamp, &stream_time, &running_time, &all_headers, &count);
+      GST_INFO_OBJECT (qtmux, "have downstream force-key-unit event on pad %s, "
+          "seqnum %d, %" GST_TIME_FORMAT " count %d", gst_pad_get_name (pad),
+          gst_event_get_seqnum (event), GST_TIME_ARGS (running_time), count);
+
+      if (qtmux->force_key_unit_event != NULL)
+        /* we are already handling an upstream force-key-unit event */
+        goto out;
+
+      if (!all_headers)
+        goto out;
+
+      qtmux->pending_key_unit_ts = running_time;
+      gst_event_replace (&qtmux->force_key_unit_event, event);
+      break;
+    }
     default:
       break;
   }
 
+out:
   if (event != NULL)
     return gst_collect_pads_event_default (pads, data, event, FALSE);
 
   return ret;
+}
+
+static gboolean
+gst_qt_mux_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
+{
+  GstQTMux *mux = GST_QT_MUX_CAST (gst_pad_get_parent (pad));
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CUSTOM_UPSTREAM:
+    {
+      GstIterator *iter;
+      GstIteratorResult iter_ret;
+      GstPad *sinkpad;
+      GstClockTime running_time;
+      gboolean all_headers, done;
+      guint count;
+
+      if (!gst_video_event_is_force_key_unit (event))
+        break;
+
+      gst_video_event_parse_upstream_force_key_unit (event,
+          &running_time, &all_headers, &count);
+
+      GST_INFO_OBJECT (mux, "received upstream force-key-unit event, "
+          "seqnum %d running_time %" GST_TIME_FORMAT " all_headers %d count %d",
+          gst_event_get_seqnum (event), GST_TIME_ARGS (running_time),
+          all_headers, count);
+
+      if (!all_headers)
+        break;
+
+      mux->pending_key_unit_ts = running_time;
+      gst_event_replace (&mux->force_key_unit_event, event);
+
+      iter = gst_element_iterate_sink_pads (GST_ELEMENT_CAST (mux));
+      done = FALSE;
+      while (!done) {
+        gboolean res = FALSE, tmp;
+        iter_ret = gst_iterator_next (iter, (GValue *) & sinkpad);
+
+        switch (iter_ret) {
+          case GST_ITERATOR_DONE:
+            done = TRUE;
+            break;
+          case GST_ITERATOR_OK:
+            GST_INFO_OBJECT (mux, "forwarding to %s",
+                gst_pad_get_name (sinkpad));
+            tmp = gst_pad_push_event (sinkpad, gst_event_ref (event));
+            GST_INFO_OBJECT (mux, "result %d", tmp);
+            /* succeed if at least one pad succeeds */
+            res |= tmp;
+            gst_object_unref (sinkpad);
+            break;
+          case GST_ITERATOR_ERROR:
+            done = TRUE;
+            break;
+          case GST_ITERATOR_RESYNC:
+            break;
+        }
+      }
+
+      gst_event_unref (event);
+      break;
+    }
+    default:
+      break;
+  }
+
+  gst_object_unref (mux);
+  return FALSE;
+}
+
+static GstEvent *
+check_pending_key_unit_event (GstEvent * pending_event, GstSegment * segment,
+    GstClockTime timestamp, GstClockTime pending_key_unit_ts)
+{
+  GstClockTime running_time, stream_time;
+  gboolean all_headers;
+  guint count;
+  GstEvent *event = NULL;
+
+  g_return_val_if_fail (pending_event != NULL, NULL);
+  g_return_val_if_fail (segment != NULL, NULL);
+
+  if (pending_event == NULL || timestamp == GST_CLOCK_TIME_NONE)
+    goto out;
+
+  running_time = gst_segment_to_running_time (segment,
+      GST_FORMAT_TIME, timestamp);
+
+  if (running_time < pending_key_unit_ts)
+    goto out;
+
+  GST_INFO ("Decide to cut at %" GST_TIME_FORMAT " wanted %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (running_time), GST_TIME_ARGS (pending_key_unit_ts));
+
+  stream_time = gst_segment_to_stream_time (segment,
+      GST_FORMAT_TIME, timestamp);
+
+  gst_video_event_parse_upstream_force_key_unit (pending_event,
+      NULL, &all_headers, &count);
+
+  event =
+      gst_video_event_new_downstream_force_key_unit (timestamp, stream_time,
+      running_time, all_headers, count);
+  gst_event_set_seqnum (event, gst_event_get_seqnum (pending_event));
+
+out:
+  return event;
 }
 
 static void
